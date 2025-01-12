@@ -1,3 +1,16 @@
+> [!IMPORTANT]
+> this is a fork of the [original](https://gihub.com/Marus/cortex-debug) extension, created just to be able to easily
+> test new features. We hope to be able to merge some improvements back to the original extension eventually.
+>
+> #### Current improvements over the original
+>
+> * ...
+>
+> #### Installation
+>
+> To avoid breaking dependencies, this version keeps the original name and publisher. To use it, download the latest
+> VSIX from [Actions](../../actions) and install it manually.
+
 # Cortex Debug
 
 ![Visual Studio Code with Cortex-Debug Installed](./images/vs-code-screenshot.png)
