@@ -1,6 +1,6 @@
 {
-    "version": "1.12.2-pre1",
-    "preview": false,
+    "version": "1.13.0",
+    "preview": true,
     "activationEvents": [
         "onDebugResolve:cortex-debug",
         "onStartupFinished"
