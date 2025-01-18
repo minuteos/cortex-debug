@@ -1,3 +1,4 @@
+/* eslint-disable no-async-promise-executor */
 import { Source } from '@vscode/debugadapter';
 import { DebugProtocol } from '@vscode/debugprotocol';
 import { hexFormat } from '../frontend/utils';

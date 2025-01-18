@@ -1,3 +1,4 @@
+/* eslint-disable no-async-promise-executor */
 import { IBackend, Stack, Variable, VariableObject, MIError,
     OurInstructionBreakpoint, OurDataBreakpoint, OurSourceBreakpoint } from '../backend';
 import * as ChildProcess from 'child_process';

@@ -1,3 +1,4 @@
+/* eslint-disable no-async-promise-executor */
 import * as net from 'net';
 import * as os from 'os';
 import * as vscode from 'vscode';

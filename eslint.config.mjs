@@ -77,7 +77,6 @@ export default tseslint.config(
             '@typescript-eslint/no-unused-vars': 'off',                 // 169 instances
             '@typescript-eslint/no-misused-promises': 'off',            // 53 instances
             '@typescript-eslint/no-floating-promises': 'off',           // 48 instances
-            'no-async-promise-executor': 'off',                         // 25 instances
         }
     },
     {

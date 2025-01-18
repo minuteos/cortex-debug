@@ -1,3 +1,4 @@
+/* eslint-disable no-async-promise-executor */
 import * as os from 'os';
 import * as net from 'net';
 import * as child_process from 'child_process';

@@ -1,3 +1,4 @@
+/* eslint-disable no-async-promise-executor */
 import { rawListeners } from 'process';
 import * as vscode from 'vscode';
 import { AddrRange, AddressRangesUtils } from './addrranges';

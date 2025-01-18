@@ -1,3 +1,4 @@
+/* eslint-disable no-async-promise-executor */
 //
 // When the new DAP spec is released
 // TODO:
@@ -69,7 +70,7 @@ enum HandleRegions {
     REG_HANDLE_FINISH     = REG_HANDLE_START + RegionSize,
     VAR_HANDLES_START     = REG_HANDLE_FINISH + 1,
     rest = 0xFFFFFFFF - VAR_HANDLES_START
-    /* eslint-enable */
+    /* eslint-enable  @stylistic/no-multi-spaces */
 }
 
 const SERVER_TYPE_MAP = {

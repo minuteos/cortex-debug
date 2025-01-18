@@ -1,3 +1,4 @@
+/* eslint-disable no-async-promise-executor */
 import { DebugProtocol } from '@vscode/debugprotocol';
 import { Handles } from '@vscode/debugadapter';
 import { MI2 } from './backend/mi2/mi2';
