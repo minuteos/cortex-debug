@@ -1,4 +1,3 @@
-/* eslint-disable no-async-promise-executor */
 import { DebugProtocol } from '@vscode/debugprotocol';
 import { Handles } from '@vscode/debugadapter';
 import { MI2 } from './backend/mi2/mi2';
@@ -88,140 +87,132 @@ export class VariablesHandler {
             }
         }
 
-        const doit = (
+        const doit = async (
             response: DebugProtocol.EvaluateResponse, args: DebugProtocol.EvaluateArguments,
             _pendContinue: any, miDebugger: MI2, session: GDBDebugSession) => {
-            return new Promise<void>(async (resolve) => {
-                if (this.isBusy() && (a.context !== 'repl')) {
-                    this.busyError(response, args);
-                    resolve();
-                    return;
-                }
+            if (this.isBusy() && (a.context !== 'repl')) {
+                this.busyError(response, args);
+                return;
+            }
 
-                // Spec says if 'frameId' is specified, evaluate in the scope specified or in the global scope. Well,
-                // we don't have a way to specify global scope ... use floating variable.
-                let threadId = session.stoppedThreadId || 1;
-                let frameId = 0;
-                if (forceNoFrameId) {
-                    threadId = frameId = -1;
-                    args.frameId = undefined;
-                } else if (args.frameId !== undefined) {
-                    [threadId, frameId] = decodeReference(args.frameId);
-                }
+            // Spec says if 'frameId' is specified, evaluate in the scope specified or in the global scope. Well,
+            // we don't have a way to specify global scope ... use floating variable.
+            let threadId = session.stoppedThreadId || 1;
+            let frameId = 0;
+            if (forceNoFrameId) {
+                threadId = frameId = -1;
+                args.frameId = undefined;
+            } else if (args.frameId !== undefined) {
+                [threadId, frameId] = decodeReference(args.frameId);
+            }
 
-                if (args.context !== 'repl') {
-                    try {
-                        const exp = args.expression;
-                        const hasher = crypto.createHash('sha256');
-                        hasher.update(exp);
-                        if (!forceNoFrameId && (args.frameId !== undefined)) {
-                            hasher.update(args.frameId.toString(16));
-                        }
-                        const exprName = hasher.digest('hex');
-                        const varObjName = `${args.context}_${exprName}`;
-                        let varObj: VariableObject;
-                        let varId = this.variableHandlesReverse.get(varObjName);
-                        let forceCreate = varId === undefined;
-                        let updateError;
-                        if (!forceCreate) {
-                            try {
-                                const cachedChange = this.cachedChangeList && this.cachedChangeList[varObjName];
-                                let changelist;
-                                if (cachedChange) {
-                                    changelist = [];
-                                } else if (this.cachedChangeList && (varId !== undefined)) {
-                                    changelist = [];
-                                } else {
-                                    const changes = await miDebugger.varUpdate(varObjName, threadId, frameId);
-                                    changelist = changes.result('changelist') ?? [];
-                                }
-                                for (const change of changelist) {
-                                    const inScope = MINode.valueOf(change, 'in_scope');
-                                    if (inScope === 'true') {
-                                        const name = MINode.valueOf(change, 'name');
-                                        const vId = this.variableHandlesReverse.get(name);
-                                        const v = this.variableHandles.get(vId) as any;
-                                        v.applyChanges(change);
-                                        if (this.cachedChangeList) {
-                                            this.cachedChangeList[name] = change;
-                                        }
-                                    } else {
-                                        const msg = `${exp} currently not in scope`;
-                                        await miDebugger.sendCommand(`var-delete ${varObjName}`);
-                                        if (session.args.showDevDebugOutput) {
-                                            session.handleMsg('log', `Expression ${msg}. Will try to create again\n`);
-                                        }
-                                        forceCreate = true;
-                                        throw new Error(msg);
-                                    }
-                                }
-                                varObj = this.variableHandles.get(varId) as any;
-                            } catch (err) {
-                                updateError = err;
-                            }
-                        }
-                        if (!this.isBusy() && (forceCreate || ((updateError instanceof MIError && updateError.message === 'Variable object not found')))) {
-                            if (this.cachedChangeList) {
-                                delete this.cachedChangeList[varObjName];
-                            }
-                            if (forceNoFrameId || (args.frameId === undefined)) {
-                                varObj = await miDebugger.varCreate(0, exp, varObjName, '@');  // Create floating variable
+            if (args.context !== 'repl') {
+                try {
+                    const exp = args.expression;
+                    const hasher = crypto.createHash('sha256');
+                    hasher.update(exp);
+                    if (!forceNoFrameId && (args.frameId !== undefined)) {
+                        hasher.update(args.frameId.toString(16));
+                    }
+                    const exprName = hasher.digest('hex');
+                    const varObjName = `${args.context}_${exprName}`;
+                    let varObj: VariableObject;
+                    let varId = this.variableHandlesReverse.get(varObjName);
+                    let forceCreate = varId === undefined;
+                    let updateError;
+                    if (!forceCreate) {
+                        try {
+                            const cachedChange = this.cachedChangeList && this.cachedChangeList[varObjName];
+                            let changelist;
+                            if (cachedChange) {
+                                changelist = [];
+                            } else if (this.cachedChangeList && (varId !== undefined)) {
+                                changelist = [];
                             } else {
-                                varObj = await miDebugger.varCreate(0, exp, varObjName, '@', threadId, frameId);
+                                const changes = await miDebugger.varUpdate(varObjName, threadId, frameId);
+                                changelist = changes.result('changelist') ?? [];
                             }
-                            varId = this.findOrCreateVariable(varObj);
-                            varObj.exp = exp;
-                            varObj.id = varId;
-                        } else if (!varObj) {
-                            throw updateError || new Error('live watch unknown error');
+                            for (const change of changelist) {
+                                const inScope = MINode.valueOf(change, 'in_scope');
+                                if (inScope === 'true') {
+                                    const name = MINode.valueOf(change, 'name');
+                                    const vId = this.variableHandlesReverse.get(name);
+                                    const v = this.variableHandles.get(vId) as any;
+                                    v.applyChanges(change);
+                                    if (this.cachedChangeList) {
+                                        this.cachedChangeList[name] = change;
+                                    }
+                                } else {
+                                    const msg = `${exp} currently not in scope`;
+                                    await miDebugger.sendCommand(`var-delete ${varObjName}`);
+                                    if (session.args.showDevDebugOutput) {
+                                        session.handleMsg('log', `Expression ${msg}. Will try to create again\n`);
+                                    }
+                                    forceCreate = true;
+                                    throw new Error(msg);
+                                }
+                            }
+                            varObj = this.variableHandles.get(varId) as any;
+                        } catch (err) {
+                            updateError = err;
                         }
-
-                        response.body = varObj.toProtocolEvaluateResponseBody();
-                        response.success = true;
-                        session.sendResponse(response);
-                    } catch (err) {
-                        if (this.isBusy()) {
-                            this.busyError(response, args);
+                    }
+                    if (!this.isBusy() && (forceCreate || ((updateError instanceof MIError && updateError.message === 'Variable object not found')))) {
+                        if (this.cachedChangeList) {
+                            delete this.cachedChangeList[varObjName];
+                        }
+                        if (forceNoFrameId || (args.frameId === undefined)) {
+                            varObj = await miDebugger.varCreate(0, exp, varObjName, '@');  // Create floating variable
                         } else {
+                            varObj = await miDebugger.varCreate(0, exp, varObjName, '@', threadId, frameId);
+                        }
+                        varId = this.findOrCreateVariable(varObj);
+                        varObj.exp = exp;
+                        varObj.id = varId;
+                    } else if (!varObj) {
+                        throw updateError || new Error('live watch unknown error');
+                    }
+
+                    response.body = varObj.toProtocolEvaluateResponseBody();
+                    response.success = true;
+                    session.sendResponse(response);
+                } catch (err) {
+                    if (this.isBusy()) {
+                        this.busyError(response, args);
+                    } else {
+                        response.body = {
+                            result: (args.context === 'hover') ? null : `<${err.toString()}>`,
+                            variablesReference: 0
+                        };
+                        session.sendResponse(response);
+                        if (session.args.showDevDebugOutput) {
+                            session.handleMsg('stderr', args.context + ' ' + err.toString());
+                        }
+                    }
+                    // this.sendErrorResponse(response, 7, err.toString());
+                }
+            } else {        // This is an 'repl'
+                try {
+                    miDebugger.sendUserInput(args.expression).then((output) => {
+                        if (typeof output === 'undefined') {
                             response.body = {
-                                result: (args.context === 'hover') ? null : `<${err.toString()}>`,
+                                result: '',
                                 variablesReference: 0
                             };
-                            session.sendResponse(response);
-                            if (session.args.showDevDebugOutput) {
-                                session.handleMsg('stderr', args.context + ' ' + err.toString());
-                            }
+                        } else {
+                            response.body = {
+                                result: JSON.stringify(output),
+                                variablesReference: 0
+                            };
                         }
-                        // this.sendErrorResponse(response, 7, err.toString());
-                    } finally {
-                        resolve();
-                    }
-                } else {        // This is an 'repl'
-                    try {
-                        miDebugger.sendUserInput(args.expression).then((output) => {
-                            if (typeof output === 'undefined') {
-                                response.body = {
-                                    result: '',
-                                    variablesReference: 0
-                                };
-                            } else {
-                                response.body = {
-                                    result: JSON.stringify(output),
-                                    variablesReference: 0
-                                };
-                            }
-                            session.sendResponse(response);
-                            resolve();
-                        }, (msg) => {
-                            session.sendErrorResponsePub(response, 8, msg.toString());
-                            resolve();
-                        });
-                    } catch (e) {
-                        session.sendErrorResponsePub(response, 8, e.toString());
-                        resolve();
-                    }
+                        session.sendResponse(response);
+                    }, (msg) => {
+                        session.sendErrorResponsePub(response, 8, msg.toString());
+                    });
+                } catch (e) {
+                    session.sendErrorResponsePub(response, 8, e.toString());
                 }
-            });
+            }
         };
 
         return this.evaluateQ.add(doit, r, a, miDebugger, session);
