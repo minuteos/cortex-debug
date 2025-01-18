@@ -1,4 +1,3 @@
-/* eslint-disable no-async-promise-executor */
 import * as os from 'os';
 import * as net from 'net';
 import * as child_process from 'child_process';
@@ -100,31 +99,26 @@ export class TcpPortScanner {
      * @param host host ip address to use. Ignored. All loopback addresses are checked
      */
     private static SeqNumber = 0;
-    public static isPortInUseEx(this: void, port: number, host: string, avoid: Set<number>): Promise<boolean> {
+    public static async isPortInUseEx(this: void, port: number, host: string, avoid: Set<number>): Promise<boolean> {
         const seq = TcpPortScanner.SeqNumber++;
         const tries = TcpPortScanner.getLocalHostAliases();
         // We could have launched all tests at once and waited on a Promise.all but that fails on Linux
         // Have seen cases where it steps on itself. In the same try, it will give an EADDRINUSE and a listen
         // will succeed. Doing one at a time avoids that but that Linux behavior is strange indeed
-        return new Promise<boolean> (async (resolve) => {
-            if (avoid && avoid.has(port)) {
-                resolve(true);
-                return;
-            }
-            for (const host of tries) {
-                try {
-                    const inUse = await TcpPortScanner.isPortInUse(port, host, seq);
-                    if (inUse) {
-                        resolve(true);
-                        return;
-                    }
-                } catch (e) {
-                    resolve(true);
-                    return;
+        if (avoid && avoid.has(port)) {
+            return true;
+        }
+
+        for (const host of tries) {
+            try {
+                const inUse = await TcpPortScanner.isPortInUse(port, host, seq);
+                if (inUse) {
+                    return true;
                 }
+            } catch (e) {
+                return true;
             }
-            resolve(false);
-        });
+        }
     }
 
     /**

@@ -1,4 +1,3 @@
-/* eslint-disable no-async-promise-executor */
 import * as os from 'os';
 import * as net from 'net';
 import * as child_process from 'child_process';
@@ -95,21 +94,11 @@ export class TcpPortScanner {
      * @param port port to use. Must be > 0 and <= 65535
      * @param host host ip address to use. Ignored. All loopback addresses are checked
      */
-    public static isPortInUseEx(this: void, port: number, _host: string): Promise<boolean> {
+    public static async isPortInUseEx(this: void, port: number, _host: string): Promise<boolean> {
         const tries = TcpPortScanner.getLocalHostAliases();
         const promises = tries.map((host) => TcpPortScanner.isPortInUse(port, host));
-
-        return new Promise(async (resolve, reject) => {
-            const results = await Promise.all(promises.map((p) => p.then((x) => x).catch(() => {})));
-            ConsoleLog('isPortInUseEx: Results', results);
-            for (const r of results) {
-                if (r !== false) {
-                    resolve(true);
-                    return;
-                }
-                resolve(false);
-            }
-        });
+        const results = await Promise.allSettled(promises);
+        return !!results.find((r) => r.status === 'rejected' || r.value !== false);
     }
 
     /**
