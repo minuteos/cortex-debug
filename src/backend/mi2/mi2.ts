@@ -1,4 +1,3 @@
-/* eslint-disable no-async-promise-executor */
 import { IBackend, Stack, Variable, VariableObject, MIError,
     OurInstructionBreakpoint, OurDataBreakpoint, OurSourceBreakpoint } from '../backend';
 import * as ChildProcess from 'child_process';
@@ -8,7 +7,8 @@ import { posix } from 'path';
 import * as os from 'os';
 import { ServerConsoleLog } from '../server';
 import { hexFormat } from '../../frontend/utils';
-import { ADAPTER_DEBUG_MODE } from '../../common';
+import { ADAPTER_DEBUG_MODE, promiseWithResolvers, ResettableTimeout } from '../../common';
+import { Sema } from 'async-sema';
 const path = posix;
 
 export interface ReadMemResults {
@@ -46,17 +46,94 @@ function couldBeOutput(line: string) {
 
 const trace = false;
 
+interface CommandOptions {
+    suppressFailure?: boolean;
+    captureOutput?: boolean;
+    forceNoDebug?: boolean;
+    timeout?: number;
+    expectResultClass?: string;
+    action?: string;
+}
+
+const DEFAULT_TIMEOUT = 5000;
+
+class Command {
+    private output?: string;
+    private resolve: (res: MINode) => void;
+    private reject: (res: MIError) => void;
+    private timeout: ResettableTimeout;
+
+    constructor(readonly owner: MI2, readonly token: number, readonly command: string, readonly options: CommandOptions = {}) {
+    }
+
+    async execute(): Promise<MINode> {
+        const { promise, resolve, reject } = promiseWithResolvers<MINode>();
+        this.resolve = resolve;
+        this.reject = reject;
+        await this.owner.sendRaw(`${this.token}-${this.command}`);
+
+        this.timeout = new ResettableTimeout(() => {
+            reject(new MIError('command execution timed out', this.command));
+        }, this.options.timeout ?? DEFAULT_TIMEOUT);
+
+        let response: MINode;
+        try {
+            response = await promise;
+        } finally {
+            this.timeout.kill();
+        }
+
+        if (response.resultRecords.resultClass === 'error'
+            || (this.options.expectResultClass
+                && response.resultRecords.resultClass !== this.options.expectResultClass)) {
+            if (this.options.suppressFailure) {
+                // log error, but still succeed
+                this.owner.log('stderr', `WARNING: Error executing command '${this.command}'`);
+                return response;
+            }
+
+            try {
+                const msg = response.result('msg');
+                throw new MIError(msg || 'Internal error', this.options.action ?? this.command);
+            } catch (e) {
+                console.error('Huh?', e);
+                throw new MIError(e.toString(), this.options.action ?? this.command);
+            }
+        }
+
+        return response;
+    }
+
+    outOfBand(node: MINode) {
+        this.timeout.reset();
+    }
+
+    response(parsed: MINode) {
+        parsed.output = this.output;
+        this.resolve(parsed);
+    }
+
+    serverLost() {
+        this.reject(new MIError('GDB server lost', this.options.action ?? this.command));
+    }
+
+    get captureOutput() {
+        return this.options.captureOutput;
+    }
+
+    appendOutput(content: string) {
+        this.output = (this.output ?? '') + content;
+    }
+}
+
 export class MI2 extends EventEmitter implements IBackend {
     public debugOutput: ADAPTER_DEBUG_MODE;
     public procEnv: any;
-    protected currentToken: number = 1;
-    protected nextTokenComing = 1;          // This will be the next token output from gdb
-    protected handlers: { [index: number]: (info: MINode) => any } = {};
-    protected needOutput: { [index: number]: '' } = {};
+    protected nextToken: number = 1;
+    protected readonly commands = new Map<number, Command>();
     protected buffer: string = '';
     protected errbuf: string = '';
     protected process: ChildProcess.ChildProcess;
-    protected stream;
     protected firstStop: boolean = true;
     protected exited: boolean = false;
     public gdbMajorVersion: number | undefined;
@@ -72,77 +149,40 @@ export class MI2 extends EventEmitter implements IBackend {
         super();
     }
 
-    public start(cwd: string, init: string[]): Promise<void> {
-        return new Promise<void>(async (resolve, reject) => {
-            const isLive = this.forLiveGdb ? 'Live ' : '';
-            this.process = ChildProcess.spawn(this.application, this.args, { cwd: cwd, env: this.procEnv });
-            this.pid = this.process.pid;
-            this.process.stdout.on('data', this.stdout.bind(this));
-            this.process.stderr.on('data', this.stderr.bind(this));
-            this.process.on('exit', (code: number, signal: string) => {
-                this.onExit(code, signal);
-            });
-            this.process.on('error', this.onError.bind(this));
-            this.process.on('spawn', () => {
-                ServerConsoleLog(isLive + `GDB started ppid=${process.pid} pid=${this.process.pid}`, this.process.pid);
-            });
-
-            if (!this.forLiveGdb) {
-                let timeout = setTimeout(() => {
-                    this.gdbStartError();
-                    setTimeout(() => {
-                        reject(new Error('Could not start gdb, no response from gdb'));
-                    }, 10);
-                    timeout = undefined;
-                }, 5000);
-
-                const swallOutput = this.debugOutput ? false : true;
-                let v;
-                try {
-                    v = await this.sendCommand('gdb-version', false, true, swallOutput);
-                    if (timeout) {
-                        clearTimeout(timeout);
-                    } else {
-                        return;
-                    }
-                } catch (e) {
-                    reject(e);
-                    return;
-                }
-                this.actuallyStarted = true;
-                this.parseVersionInfo(v.output);
-            } else {
-                this.actuallyStarted = true;
-            }
-
-            if ((this.gdbMajorVersion !== undefined) && (this.gdbMajorVersion < 9)) {
-                this.isExiting = true;
-                const ver = this.gdbMajorVersion ? this.gdbMajorVersion.toString() : 'Unknown';
-                const msg = `ERROR: GDB major version should be >= 9, yours is ${ver}`;
-                this.log('stderr', msg);
-                this.sendRaw('-gdb-exit');
-                // reject(new Error(msg));
-                resolve();
-                return;
-            }
-            const asyncCmd = 'gdb-set mi-async on';
-            const promises = [asyncCmd, ...init].map((c) => this.sendCommand(c));
-            Promise.all(promises).then(() => {
-                /*
-                gdb crashes or runs out of memory with the following
-                if (this.gdbMajorVersion >= 9) {
-                    this.gdbVarsPromise = new Promise((resolve) => {
-                        this.sendCommand('symbol-info-variables', false, false, true).then((x) => {
-                            resolve(x);
-                        }, (e) => {
-                            reject(e);
-                        });
-                    });
-                }
-                */
-                resolve();
-            }, reject);
+    public async start(cwd: string, init: string[]): Promise<void> {
+        const isLive = this.forLiveGdb ? 'Live ' : '';
+        this.process = ChildProcess.spawn(this.application, this.args, { cwd: cwd, env: this.procEnv });
+        this.pid = this.process.pid;
+        this.process.stdout.on('data', this.stdout.bind(this));
+        this.process.stderr.on('data', this.stderr.bind(this));
+        this.process.on('exit', this.onExit.bind(this));
+        this.process.on('error', this.onError.bind(this));
+        this.process.on('spawn', () => {
+            ServerConsoleLog(isLive + `GDB started ppid=${process.pid} pid=${this.process.pid}`, this.process.pid);
         });
+
+        if (!this.forLiveGdb) {
+            const v = await this.sendCommand('gdb-version', {
+                captureOutput: true,
+                timeout: 5000,
+            });
+            this.parseVersionInfo(v.output);
+        }
+        this.actuallyStarted = true;
+
+        if ((this.gdbMajorVersion !== undefined) && (this.gdbMajorVersion < 9)) {
+            this.isExiting = true;
+            const ver = this.gdbMajorVersion ? this.gdbMajorVersion.toString() : 'Unknown';
+            const msg = `ERROR: GDB major version should be >= 9, yours is ${ver}`;
+            this.log('stderr', msg);
+            this.sendRaw('-gdb-exit');
+            // throw new Error(msg);
+            return;
+        }
+
+        const asyncCmd = 'gdb-set mi-async on';
+        const promises = [asyncCmd, ...init].map((c) => this.sendCommand(c));
+        await Promise.all(promises);
     }
 
     private onError(err) {
@@ -166,14 +206,10 @@ export class MI2 extends EventEmitter implements IBackend {
         }
     }
 
-    public connect(commands: string[]): Thenable<any> {
-        return new Promise<void>((resolve, reject) => {
-            const promises = commands.map((c) => this.sendCommand(c));
-            Promise.all(promises).then(() => {
-                this.emit('debug-ready');
-                resolve();
-            }, reject);
-        });
+    public async connect(commands: string[]): Promise<any> {
+        const promises = commands.map((c) => this.sendCommand(c));
+        await Promise.all(promises);
+        this.emit('debug-ready');
     }
 
     private onExit(code: number, signal: string) {
@@ -188,6 +224,10 @@ export class MI2 extends EventEmitter implements IBackend {
             const how = this.exiting ? '' : ((code || signal) ? ' unexpectedly' : '');
             const msg = `GDB session ended${how}. exit-code: ${codestr}${sigstr}\n`;
             this.emit('quit', how ? 'stderr' : 'stdout', msg);
+        }
+        // abort all running commands
+        for (const cmd of this.commands.values()) {
+            cmd.serverLost();
         }
     }
 
@@ -262,7 +302,8 @@ export class MI2 extends EventEmitter implements IBackend {
                 }
             } else {
                 const parsed = parseMI(line);
-                if (this.debugOutput && (this.debugOutput !== ADAPTER_DEBUG_MODE.NONE)) {
+                const command = this.commands.get(parsed.token);
+                if (!command?.options.forceNoDebug && this.debugOutput && (this.debugOutput !== ADAPTER_DEBUG_MODE.NONE)) {
                     if ((this.debugOutput === ADAPTER_DEBUG_MODE.RAW) || (this.debugOutput === ADAPTER_DEBUG_MODE.BOTH)) {
                         this.log('log', '-> ' + line);
                     }
@@ -270,17 +311,11 @@ export class MI2 extends EventEmitter implements IBackend {
                         this.log('log', 'GDB -> App: ' + JSON.stringify(parsed));
                     }
                 }
-                if (parsed.token !== undefined) {
-                    if (this.needOutput[parsed.token] !== undefined) {
-                        parsed.output = this.needOutput[parsed.token];
-                    }
-                    this.nextTokenComing = parsed.token + 1;
-                }
+
                 let handled = false;
                 if (parsed.token !== undefined && parsed.resultRecords) {
-                    if (this.handlers[parsed.token]) {
-                        this.handlers[parsed.token](parsed);
-                        delete this.handlers[parsed.token];
+                    if (command) {
+                        command.response(parsed);
                         handled = true;
                     } else if (parsed.token === this.lastContinueSeqId) {
                         // This is the situation where the last continue actually fails but is initially reported
@@ -296,13 +331,18 @@ export class MI2 extends EventEmitter implements IBackend {
                     this.log('stderr', parsed.result('msg') || line);
                 }
                 if (parsed.outOfBandRecord) {
+                    command?.outOfBand(parsed);
                     parsed.outOfBandRecord.forEach((record) => {
                         if (record.isStream) {
-                            if ((record.type === 'console') && (this.needOutput[this.nextTokenComing] !== undefined)) {
-                                this.needOutput[this.nextTokenComing] += record.content;
-                            } else {
-                                this.log(record.type, record.content);
+                            if (record.type === 'console') {
+                                const activeCommand = [...this.commands.values()].at(-1);
+                                if (activeCommand && activeCommand.captureOutput) {
+                                    activeCommand.appendOutput(record.content);
+                                    return;
+                                }
                             }
+
+                            this.log(record.type, record.content);
                         } else {
                             if (record.type === 'exec') {
                                 this.emit('exec-async-output', parsed);
@@ -492,75 +532,56 @@ export class MI2 extends EventEmitter implements IBackend {
         });
     }
 
-    public interrupt(arg: string = ''): Thenable<boolean> {
+    public async interrupt(arg: string = ''): Promise<boolean> {
         if (trace) {
             this.log('stderr', 'interrupt ' + arg);
         }
-        return new Promise((resolve, reject) => {
-            this.sendCommand(`exec-interrupt ${arg}`).then((info) => {
-                resolve(info.resultRecords.resultClass === 'done');
-            }, reject);
-        });
+        const info = await this.sendCommand(`exec-interrupt ${arg}`);
+        return info.resultRecords.resultClass === 'done';
     }
 
-    public continue(threadId: number): Thenable<boolean> {
+    public async continue(threadId: number): Promise<boolean> {
         if (trace) {
             this.log('stderr', 'continue');
         }
-        return new Promise((resolve, reject) => {
-            this.sendCommand(`exec-continue --thread ${threadId}`).then((info) => {
-                resolve(info.resultRecords.resultClass === 'running');
-            }, reject);
-        });
+        const info = await this.sendCommand(`exec-continue --thread ${threadId}`);
+        return info.resultRecords.resultClass === 'running';
     }
 
-    public next(threadId: number, instruction?: boolean): Thenable<boolean> {
+    public async next(threadId: number, instruction?: boolean): Promise<boolean> {
         if (trace) {
             this.log('stderr', 'next');
         }
-        return new Promise((resolve, reject) => {
-            const baseCmd = instruction ? 'exec-next-instruction' : 'exec-next';
-            this.sendCommand(`${baseCmd} --thread ${threadId}`).then((info) => {
-                resolve(info.resultRecords.resultClass === 'running');
-            }, reject);
-        });
+        const baseCmd = instruction ? 'exec-next-instruction' : 'exec-next';
+        const info = await this.sendCommand(`${baseCmd} --thread ${threadId}`);
+        return info.resultRecords.resultClass === 'running';
     }
 
-    public step(threadId: number, instruction?: boolean): Thenable<boolean> {
+    public async step(threadId: number, instruction?: boolean): Promise<boolean> {
         if (trace) {
             this.log('stderr', 'step');
         }
-        return new Promise((resolve, reject) => {
-            const baseCmd = instruction ? 'exec-step-instruction' : 'exec-step';
-            this.sendCommand(`${baseCmd} --thread ${threadId}`).then((info) => {
-                resolve(info.resultRecords.resultClass === 'running');
-            }, reject);
-        });
+        const baseCmd = instruction ? 'exec-step-instruction' : 'exec-step';
+        const info = await this.sendCommand(`${baseCmd} --thread ${threadId}`);
+        return info.resultRecords.resultClass === 'running';
     }
 
-    public stepOut(threadId: number): Thenable<boolean> {
+    public async stepOut(threadId: number): Promise<boolean> {
         if (trace) {
             this.log('stderr', 'stepOut');
         }
-        return new Promise((resolve, reject) => {
-            this.sendCommand(`exec-finish --thread ${threadId}`).then((info) => {
-                resolve(info.resultRecords.resultClass === 'running');
-            }, reject);
-        });
+        const info = await this.sendCommand(`exec-finish --thread ${threadId}`);
+        return info.resultRecords.resultClass === 'running';
     }
 
-    public goto(filename: string, line: number): Thenable<boolean> {
+    public async goto(filename: string, line: number): Promise<boolean> {
         if (trace) {
             this.log('stderr', 'goto');
         }
-        return new Promise((resolve, reject) => {
-            const target: string = '"' + (filename ? escape(filename) + ':' : '') + line.toString() + '"';
-            this.sendCommand('break-insert -t ' + target).then(() => {
-                this.sendCommand('exec-jump ' + target).then((info) => {
-                    resolve(info.resultRecords.resultClass === 'running');
-                }, reject);
-            }, reject);
-        });
+        const target: string = '"' + (filename ? escape(filename) + ':' : '') + line.toString() + '"';
+        await this.sendCommand('break-insert -t ' + target);
+        const info = await this.sendCommand('exec-jump ' + target);
+        return info.resultRecords.resultClass === 'running';
     }
 
     public restart(commands: string[]): Thenable<boolean> {
@@ -577,21 +598,11 @@ export class MI2 extends EventEmitter implements IBackend {
         return this._sendCommandSequence(commands);
     }
 
-    private _sendCommandSequence(commands: string[]): Thenable<boolean> {
-        return new Promise((resolve, reject) => {
-            const nextCommand = ((commands: string[]) => {
-                if (commands.length === 0) {
-                    resolve(true);
-                } else {
-                    const command = commands[0];
-                    this.sendCommand(command).then((r) => {
-                        nextCommand(commands.slice(1));
-                    }, reject);
-                }
-            }).bind(this);
-
-            nextCommand(commands);
-        });
+    private async _sendCommandSequence(commands: string[]): Promise<boolean> {
+        for (const command of commands) {
+            await this.sendCommand(command);
+        }
+        return true;
     }
 
     public changeVariable(name: string, rawValue: string): Thenable<any> {
@@ -605,233 +616,219 @@ export class MI2 extends EventEmitter implements IBackend {
         if (trace) {
             this.log('stderr', 'setBreakPointCondition');
         }
-        return this.sendCommand('break-condition ' + bkptNum + ' ' + condition);
+        return this.sendCommand('break-condition ' + bkptNum + ' ' + condition, {
+            expectResultClass: 'done',
+            action: 'Setting breakpoint condition',
+        });
     }
 
-    public addBreakPoint(breakpoint: OurSourceBreakpoint): Promise<OurSourceBreakpoint> {
+    public async addBreakPoint(breakpoint: OurSourceBreakpoint): Promise<OurSourceBreakpoint> {
         if (trace) {
             this.log('stderr', 'addBreakPoint');
         }
-        return new Promise((resolve, reject) => {
-            let bkptArgs = '';
-            if (breakpoint.hitCondition) {
-                if (breakpoint.hitCondition[0] === '>') {
-                    bkptArgs += '-i ' + numRegex.exec(breakpoint.hitCondition.substr(1))[0] + ' ';
-                } else {
-                    const match = numRegex.exec(breakpoint.hitCondition)[0];
-                    if (match.length !== breakpoint.hitCondition.length) {
-                        this.log('stderr',
-                            'Unsupported break count expression: \'' + breakpoint.hitCondition + '\'. '
-                            + 'Only supports \'X\' for breaking once after X times or \'>X\' for ignoring the first X breaks'
-                        );
-                        bkptArgs += '-t ';
-                    } else if (parseInt(match) !== 0) {
-                        bkptArgs += '-t -i ' + parseInt(match) + ' ';
-                    }
-                }
-            }
 
-            if (breakpoint.condition) {
-                bkptArgs += `-c "${breakpoint.condition}" `;
-            }
-
-            if (breakpoint.raw) {
-                bkptArgs += '*' + escape(breakpoint.raw);
+        let bkptArgs = '';
+        if (breakpoint.hitCondition) {
+            if (breakpoint.hitCondition[0] === '>') {
+                bkptArgs += '-i ' + numRegex.exec(breakpoint.hitCondition.substr(1))[0] + ' ';
             } else {
-                bkptArgs += '"' + escape(breakpoint.file) + ':' + breakpoint.line + '"';
-            }
-
-            const cmd = breakpoint.logMessage ? 'dprintf-insert' : 'break-insert';
-            if (breakpoint.logMessage) {
-                bkptArgs += ' ' + breakpoint.logMessage;
-            }
-
-            this.sendCommand(`${cmd} ${bkptArgs}`).then((result) => {
-                if (result.resultRecords.resultClass === 'done') {
-                    const bkptNum = parseInt(result.result('bkpt.number'));
-                    const line = result.result('bkpt.line');
-                    const addr = result.result('bkpt.addr');
-                    breakpoint.line = line ? parseInt(line) : breakpoint.line;
-                    breakpoint.number = bkptNum;
-                    if (addr) {
-                        breakpoint.address = addr;
-                    }
-
-                    if (breakpoint.file === undefined) {
-                        const file = result.result('bkpt.fullname') || result.record('bkpt.file');
-                        breakpoint.file = file ? file : undefined;
-                    }
-                    resolve(breakpoint);
-                } else {
-                    reject(new MIError(result.result('msg') || 'Internal error', `Setting breakpoint at ${bkptArgs}`));
+                const match = numRegex.exec(breakpoint.hitCondition)[0];
+                if (match.length !== breakpoint.hitCondition.length) {
+                    this.log('stderr',
+                        'Unsupported break count expression: \'' + breakpoint.hitCondition + '\'. '
+                        + 'Only supports \'X\' for breaking once after X times or \'>X\' for ignoring the first X breaks'
+                    );
+                    bkptArgs += '-t ';
+                } else if (parseInt(match) !== 0) {
+                    bkptArgs += '-t -i ' + parseInt(match) + ' ';
                 }
-            }, reject);
+            }
+        }
+
+        if (breakpoint.condition) {
+            bkptArgs += `-c "${breakpoint.condition}" `;
+        }
+
+        if (breakpoint.raw) {
+            bkptArgs += '*' + escape(breakpoint.raw);
+        } else {
+            bkptArgs += '"' + escape(breakpoint.file) + ':' + breakpoint.line + '"';
+        }
+
+        const cmd = breakpoint.logMessage ? 'dprintf-insert' : 'break-insert';
+        if (breakpoint.logMessage) {
+            bkptArgs += ' ' + breakpoint.logMessage;
+        }
+
+        const result = await this.sendCommand(`${cmd} ${bkptArgs}`, {
+            expectResultClass: 'done',
+            action: `Setting breakpoint at ${bkptArgs}`,
         });
+
+        const bkptNum = parseInt(result.result('bkpt.number'));
+        const line = result.result('bkpt.line');
+        const addr = result.result('bkpt.addr');
+        breakpoint.line = line ? parseInt(line) : breakpoint.line;
+        breakpoint.number = bkptNum;
+        if (addr) {
+            breakpoint.address = addr;
+        }
+
+        if (breakpoint.file === undefined) {
+            const file = result.result('bkpt.fullname') || result.record('bkpt.file');
+            breakpoint.file = file ? file : undefined;
+        }
+        return breakpoint;
     }
 
-    public addInstrBreakPoint(breakpoint: OurInstructionBreakpoint): Promise<OurInstructionBreakpoint> {
+    public async addInstrBreakPoint(breakpoint: OurInstructionBreakpoint): Promise<OurInstructionBreakpoint> {
         if (trace) {
             this.log('stderr', 'addBreakPoint');
         }
-        return new Promise((resolve, reject) => {
-            let bkptArgs = '';
-            if (breakpoint.condition) {
-                bkptArgs += `-c "${breakpoint.condition}" `;
-            }
 
-            bkptArgs += '*' + hexFormat(breakpoint.address);
+        let bkptArgs = '';
+        if (breakpoint.condition) {
+            bkptArgs += `-c "${breakpoint.condition}" `;
+        }
 
-            this.sendCommand(`break-insert ${bkptArgs}`).then((result) => {
-                if (result.resultRecords.resultClass === 'done') {
-                    const bkptNum = parseInt(result.result('bkpt.number'));
-                    breakpoint.number = bkptNum;
-                    resolve(breakpoint);
-                } else {
-                    reject(new MIError(result.result('msg') || 'Internal error', `Setting breakpoint at ${bkptArgs}`));
-                }
-            }, reject);
+        bkptArgs += '*' + hexFormat(breakpoint.address);
+
+        const result = await this.sendCommand(`break-insert ${bkptArgs}`, {
+            expectResultClass: 'done',
+            action: `Setting breakpoint at ${bkptArgs}`
         });
+
+        const bkptNum = parseInt(result.result('bkpt.number'));
+        breakpoint.number = bkptNum;
+        return breakpoint;
     }
 
-    public removeBreakpoints(breakpoints: number[]): Promise<boolean> {
+    public async removeBreakpoints(breakpoints: number[]): Promise<boolean> {
         if (trace) {
             this.log('stderr', 'removeBreakPoint');
         }
-        return new Promise((resolve, reject) => {
-            if (breakpoints.length === 0) {
-                resolve(true);
-            } else {
-                const cmd = 'break-delete ' + breakpoints.join(' ');
-                this.sendCommand(cmd).then((result) => {
-                    resolve(result.resultRecords.resultClass === 'done');
-                }, reject);
-            }
-        });
+
+        if (breakpoints.length === 0) {
+            return true;
+        }
+
+        const cmd = 'break-delete ' + breakpoints.join(' ');
+        const result = await this.sendCommand(cmd);
+        return result.resultRecords.resultClass === 'done';
     }
 
-    public addDataBreakPoint(breakpoint: OurDataBreakpoint): Promise<OurDataBreakpoint> {
+    public async addDataBreakPoint(breakpoint: OurDataBreakpoint): Promise<OurDataBreakpoint> {
         if (trace) {
             this.log('stderr', 'addBreakPoint');
         }
-        return new Promise((resolve, reject) => {
-            let bkptArgs = '';
-            if (breakpoint.hitCondition) {
-                if (breakpoint.hitCondition[0] === '>') {
-                    bkptArgs += '-i ' + numRegex.exec(breakpoint.hitCondition.substr(1))[0] + ' ';
-                } else {
-                    const match = numRegex.exec(breakpoint.hitCondition)[0];
-                    if (match.length !== breakpoint.hitCondition.length) {
-                        this.log('stderr',
-                            'Unsupported break count expression: \'' + breakpoint.hitCondition + '\'. '
-                            + 'Only supports \'X\' for breaking once after X times or \'>X\' for ignoring the first X breaks'
-                        );
-                        bkptArgs += '-t ';
-                    } else if (parseInt(match) !== 0) {
-                        bkptArgs += '-t -i ' + parseInt(match) + ' ';
-                    }
+
+        let bkptArgs = '';
+        if (breakpoint.hitCondition) {
+            if (breakpoint.hitCondition[0] === '>') {
+                bkptArgs += '-i ' + numRegex.exec(breakpoint.hitCondition.substr(1))[0] + ' ';
+            } else {
+                const match = numRegex.exec(breakpoint.hitCondition)[0];
+                if (match.length !== breakpoint.hitCondition.length) {
+                    this.log('stderr',
+                        'Unsupported break count expression: \'' + breakpoint.hitCondition + '\'. '
+                        + 'Only supports \'X\' for breaking once after X times or \'>X\' for ignoring the first X breaks'
+                    );
+                    bkptArgs += '-t ';
+                } else if (parseInt(match) !== 0) {
+                    bkptArgs += '-t -i ' + parseInt(match) + ' ';
                 }
             }
+        }
 
-            bkptArgs += breakpoint.dataId;
-            const aType = breakpoint.accessType === 'read' ? '-r' : (breakpoint.accessType === 'readWrite' ? '-a' : '');
-            this.sendCommand(`break-watch ${aType} ${bkptArgs}`).then((result) => {
-                if (result.resultRecords.resultClass === 'done') {
-                    const bkptNum = parseInt(result.result('hw-awpt.number') || result.result('hw-rwpt.number') || result.result('wpt.number'));
-                    breakpoint.number = bkptNum;
+        bkptArgs += breakpoint.dataId;
+        const aType = breakpoint.accessType === 'read' ? '-r' : (breakpoint.accessType === 'readWrite' ? '-a' : '');
+        const result = await this.sendCommand(`break-watch ${aType} ${bkptArgs}`, {
+            expectResultClass: 'done',
+            action: `Setting breakpoint at ${bkptArgs}`,
+        });
 
-                    if (breakpoint.condition) {
-                        this.setBreakPointCondition(bkptNum, breakpoint.condition).then((result) => {
-                            if (result.resultRecords.resultClass === 'done') {
-                                resolve(breakpoint);
-                            } else {
-                                reject(new MIError(result.result('msg') || 'Internal error', 'Setting breakpoint condition'));
-                            }
-                        },
-                        (reason) => {
-                            // Just delete the breakpoint we just created as the condition creation failed
-                            this.sendCommand(`break-delete ${bkptNum}`).then((x) => {}, (e) => {});
-                            reject(reason);     // Use this reason as reason for failing to create the breakpoint
-                        });
-                    } else {
-                        resolve(breakpoint);
-                    }
-                } else {
-                    reject(new MIError(result.result('msg') || 'Internal error', `Setting breakpoint at ${bkptArgs}`));
+        const bkptNum = parseInt(result.result('hw-awpt.number') || result.result('hw-rwpt.number') || result.result('wpt.number'));
+        breakpoint.number = bkptNum;
+
+        if (breakpoint.condition) {
+            try {
+                await this.setBreakPointCondition(bkptNum, breakpoint.condition);
+            } catch (err) {
+                // Just delete the breakpoint we just created as the condition creation failed
+                try {
+                    await this.sendCommand(`break-delete ${bkptNum}`);
+                } catch (err) {
+                    console.error('MI2: failed to delete breakpoint after failing to set condition', err);
                 }
-            }, reject);
-        });
+                throw err;  // Use this reason as reason for failing to create the breakpoint
+            }
+        }
+
+        return breakpoint;
     }
 
-    public getFrame(thread: number, frame: number): Thenable<Stack> {
-        return new Promise((resolve, reject) => {
-            const command = `stack-info-frame --thread ${thread} --frame ${frame}`;
+    public async getFrame(thread: number, frameNumber: number): Promise<Stack> {
+        const command = `stack-info-frame --thread ${thread} --frame ${frameNumber}`;
 
-            this.sendCommand(command).then((result) => {
-                const frame = result.result('frame');
-                const level = MINode.valueOf(frame, 'level');
-                const addr = MINode.valueOf(frame, 'addr');
-                const func = MINode.valueOf(frame, 'func');
-                const file = MINode.valueOf(frame, 'file');
-                const fullname = MINode.valueOf(frame, 'fullname');
-                let line = 0;
-                const linestr = MINode.valueOf(frame, 'line');
-                if (linestr) { line = parseInt(linestr); }
+        const result = await this.sendCommand(command);
+        const frame = result.result('frame');
+        const level = MINode.valueOf(frame, 'level');
+        const addr = MINode.valueOf(frame, 'addr');
+        const func = MINode.valueOf(frame, 'func');
+        const file = MINode.valueOf(frame, 'file');
+        const fullname = MINode.valueOf(frame, 'fullname');
+        let line = 0;
+        const linestr = MINode.valueOf(frame, 'line');
+        if (linestr) { line = parseInt(linestr); }
 
-                resolve({
-                    address: addr,
-                    fileName: file,
-                    file: fullname,
-                    function: func,
-                    level: level,
-                    line: line
-                });
-            }, reject);
-        });
+        return {
+            address: addr,
+            fileName: file,
+            file: fullname,
+            function: func,
+            level: level,
+            line: line
+        };
     }
 
-    public getStackDepth(threadId: number, maxDepth: number = 1000): Thenable<number> {
+    public async getStackDepth(threadId: number, maxDepth: number = 1000): Promise<number> {
         if (trace) {
             this.log('stderr', 'getStackDepth');
         }
-        return new Promise((resolve, reject) => {
-            this.sendCommand(`stack-info-depth --thread ${threadId} ${maxDepth}`).then((result) => {
-                const depth = result.result('depth');
-                const ret = parseInt(depth);
-                resolve(ret);
-            }, reject);
-        });
+        const result = await this.sendCommand(`stack-info-depth --thread ${threadId} ${maxDepth}`);
+        const depth = result.result('depth');
+        const ret = parseInt(depth);
+        return ret;
     }
 
-    public getStack(threadId: number, startLevel: number, maxLevels: number): Thenable<Stack[]> {
+    public async getStack(threadId: number, startLevel: number, maxLevels: number): Promise<Stack[]> {
         if (trace) {
             this.log('stderr', 'getStack');
         }
-        return new Promise((resolve, reject) => {
-            this.sendCommand(`stack-list-frames --thread ${threadId} ${startLevel} ${maxLevels}`).then((result) => {
-                const stack = result.result('stack');
-                const ret: Stack[] = [];
-                stack.forEach((element) => {
-                    const level = MINode.valueOf(element, '@frame.level');
-                    const addr = MINode.valueOf(element, '@frame.addr');
-                    const func = MINode.valueOf(element, '@frame.func');
-                    const filename = MINode.valueOf(element, '@frame.file');
-                    const file = MINode.valueOf(element, '@frame.fullname');
-                    let line = 0;
-                    const lnstr = MINode.valueOf(element, '@frame.line');
-                    if (lnstr) { line = parseInt(lnstr); }
-                    const from = parseInt(MINode.valueOf(element, '@frame.from'));
-                    ret.push({
-                        address: addr,
-                        fileName: filename,
-                        file: file,
-                        function: func || from,
-                        level: level,
-                        line: line
-                    });
-                });
-                resolve(ret);
-            }, reject);
+
+        const result = await this.sendCommand(`stack-list-frames --thread ${threadId} ${startLevel} ${maxLevels}`);
+        const stack = result.result('stack');
+        const ret: Stack[] = [];
+        stack.forEach((element) => {
+            const level = MINode.valueOf(element, '@frame.level');
+            const addr = MINode.valueOf(element, '@frame.addr');
+            const func = MINode.valueOf(element, '@frame.func');
+            const filename = MINode.valueOf(element, '@frame.file');
+            const file = MINode.valueOf(element, '@frame.fullname');
+            let line = 0;
+            const lnstr = MINode.valueOf(element, '@frame.line');
+            if (lnstr) { line = parseInt(lnstr); }
+            const from = parseInt(MINode.valueOf(element, '@frame.from'));
+            ret.push({
+                address: addr,
+                fileName: filename,
+                file: file,
+                function: func || from,
+                level: level,
+                line: line
+            });
         });
+        return ret;
     }
 
     public async getStackVariables(thread: number, frame: number): Promise<Variable[]> {
@@ -839,49 +836,40 @@ export class MI2 extends EventEmitter implements IBackend {
             this.log('stderr', 'getStackVariables');
         }
 
-        try {
-            const result = await this.sendCommand(`stack-list-variables --thread ${thread} --frame ${frame} --simple-values`);
-            const variables = result.result('variables');
-            const ret: Variable[] = [];
-            for (const element of variables) {
-                const key = MINode.valueOf(element, 'name');
-                const value = MINode.valueOf(element, 'value');
-                const type = MINode.valueOf(element, 'type');
-                ret.push({
-                    name: key,
-                    valueStr: value,
-                    type: type,
-                    raw: element
-                });
-            }
-            return Promise.resolve(ret);
-        } catch (e) {
-            return Promise.reject(e);
+        const result = await this.sendCommand(`stack-list-variables --thread ${thread} --frame ${frame} --simple-values`);
+        const variables = result.result('variables');
+        const ret: Variable[] = [];
+        for (const element of variables) {
+            const key = MINode.valueOf(element, 'name');
+            const value = MINode.valueOf(element, 'value');
+            const type = MINode.valueOf(element, 'type');
+            ret.push({
+                name: key,
+                valueStr: value,
+                type: type,
+                raw: element
+            });
         }
+        return ret;
     }
 
-    public examineMemory(from: number, length: number): Thenable<any> {
+    public async examineMemory(from: number, length: number): Promise<any> {
         if (trace) {
             this.log('stderr', 'examineMemory');
         }
-        return new Promise((resolve, reject) => {
-            this.sendCommand('data-read-memory-bytes 0x' + from.toString(16) + ' ' + length).then((result) => {
-                resolve(result.result('memory[0].contents'));
-            }, reject);
-        });
+
+        const result = await this.sendCommand('data-read-memory-bytes 0x' + from.toString(16) + ' ' + length);
+        return result.result('memory[0].contents');
     }
 
     // Pass negative threadId/frameId to specify no context or current context
-    public evalExpression(name: string, threadId: number, frameId: number): Thenable<any> {
+    public evalExpression(name: string, threadId: number, frameId: number): Promise<MINode> {
         if (trace) {
             this.log('stderr', 'evalExpression');
         }
-        return new Promise((resolve, reject) => {
-            const thFr = MI2.getThreadFrameStr(threadId, frameId);
-            this.sendCommand(`data-evaluate-expression ${thFr} ` + name).then((result) => {
-                resolve(result);
-            }, reject);
-        });
+
+        const thFr = MI2.getThreadFrameStr(threadId, frameId);
+        return this.sendCommand(`data-evaluate-expression ${thFr} ` + name);
     }
 
     public static FORMAT_SPEC_MAP = {
@@ -1002,19 +990,22 @@ export class MI2 extends EventEmitter implements IBackend {
         }
     }
 
-    public sendRaw(raw: string) {
+    public sendRaw(raw: string, suppressOutput?: boolean): Promise<void> {
         if (!this.process?.stdin) {
-            // Already closed, should we throw an exception?
-            return;
+            throw new Error('Cannot send command, GDB is already terminated');
         }
-        if (this.debugOutput || trace) {
+        if ((!suppressOutput && this.debugOutput) || trace) {
             this.log('log', raw);
         }
-        this.process.stdin.write(raw + '\n');   // Sometimes, process is already null
-    }
-
-    public getCurrentToken(): number {
-        return this.currentToken;
+        const { promise, resolve, reject } = promiseWithResolvers();
+        this.process.stdin.write(raw + '\n', (error) => {
+            if (error) {
+                reject(error);
+            } else {
+                resolve();
+            }
+        });   // Sometimes, process is already null
+        return promise;
     }
 
     public isRunning(): boolean {
@@ -1024,95 +1015,33 @@ export class MI2 extends EventEmitter implements IBackend {
         return !!this.process;
     }
 
-    public sendOneCommand(args: SendCommaindIF): Thenable<MINode> {
-        const sel = this.currentToken++;
-        return new Promise((resolve, reject) => {
-            const errReport = (arg: MINode | Error) => {
-                const nd = arg as MINode;
-                if (args.suppressFailure && nd) {
-                    this.log('stderr', `WARNING: Error executing command '${args.command}'`);
-                    resolve(nd);
-                } else if (!nd) {
-                    reject(new MIError(arg ? arg.toString() : 'Unknown error', args.command));
-                } else {
-                    try {
-                        const msg = nd.result('msg');
-                        reject(new MIError(msg || 'Internal error', args.command));
-                    } catch (e) {
-                        console.log(`Huh? ${e}`);
-                        reject(new MIError(e.toString(), args.command));
-                    }
-                }
-            };
-            if (args.swallowStdout) {
-                this.needOutput[sel] = '';
-            }
-            const save = this.debugOutput;
-            if (args.forceNoDebug && this.debugOutput) {
-                this.log('log', `Suppressing output for '${sel}-${args.command}'`);
-                // We need to be more sophisticated than this. There could be other commands in flight
-                // We should do this how we do the swallowStdout
-                this.debugOutput = undefined;
-            }
-            this.handlers[sel] = (node: MINode) => {
-                this.debugOutput = save;
-                if (args.swallowStdout) {
-                    delete this.needOutput[sel];
-                }
-                if (node.resultRecords.resultClass === 'error') {
-                    errReport(node);
-                } else {
-                    resolve(node);
-                }
-            };
-            if (args.command.startsWith('exec-continue')) {
-                this.lastContinueSeqId = sel;
-            }
-            try {
-                this.sendRaw(sel + '-' + args.command);
-            } catch (e) {
-                this.debugOutput = save;
-                errReport(e);
-            }
-        });
+    public async doSendCommand(command: string, opts?: CommandOptions): Promise<MINode> {
+        const token = this.nextToken++;
+
+        if (command.startsWith('exec-continue')) {
+            this.lastContinueSeqId = token;
+        }
+
+        const cmd = new Command(this, token, command, opts);
+        this.commands.set(token, cmd);
+        try {
+            return await cmd.execute();
+        } finally {
+            this.commands.delete(token);
+        }
     }
 
-    private commandQueue: SendCommaindIF[] = [];
-    private commandQueueBusy = false;
-    public sendCommand(command: string, suppressFailure = false, swallowStdout = false, forceNoDebug = false): Thenable<MINode> {
+    // promise used for chaining the commands together, resolved whenever the current command completes
+    private commandSemaphore = new Sema(1);
+    public async sendCommand(command: string, opts?: CommandOptions): Promise<MINode> {
         // We queue these requests as there can be a flood of them. Especially if you have two variables or same name back to back
         // the second can fail because we are still in the process of creating that variable (update, fail, then create). Sources
         // for requests are from RTOS viewers, watch windows and hover. Even a watch window can have duplicates.
-        return new Promise(async (resolve, reject) => {
-            const args: SendCommaindIF = {
-                command: command,
-                suppressFailure: suppressFailure,
-                swallowStdout: swallowStdout,
-                forceNoDebug: forceNoDebug,
-                resolve: resolve,
-                reject: reject
-            };
-            this.commandQueue.push(args);
-            while (!this.commandQueueBusy && (this.commandQueue.length > 0)) {
-                this.commandQueueBusy = true;
-                const obj = this.commandQueue.shift();
-                try {
-                    const result = await this.sendOneCommand(obj);
-                    obj.resolve(result);
-                } catch (e) {
-                    obj.reject(e);
-                }
-                this.commandQueueBusy = false;
-            }
-        });
+        await this.commandSemaphore.acquire();
+        try {
+            return await this.doSendCommand(command, opts);
+        } finally {
+            this.commandSemaphore.release();
+        }
     }
-}
-
-interface SendCommaindIF {
-    command: string;
-    suppressFailure: boolean;
-    swallowStdout: boolean;
-    forceNoDebug: boolean;
-    resolve: any;
-    reject: any;
 }

@@ -231,7 +231,7 @@ export class GdbDisassembler {
     }
 
     public async setArchitecture(): Promise<void> {
-        const miNode = await this.miDebugger.sendCommand('interpreter-exec console "show architecture"', false, true);
+        const miNode = await this.miDebugger.sendCommand('interpreter-exec console "show architecture"', { captureOutput: true });
         const str = miNode.output;
         let found = false;
         // Some of this copied from MIEngine. Of course nothing other Arm-32 was tested
@@ -292,7 +292,7 @@ export class GdbDisassembler {
         try {
             await this.setArchitecture();
             this.memoryRegions = [];
-            const miNode = await this.miDebugger.sendCommand('interpreter-exec console "info mem"', false, true);
+            const miNode = await this.miDebugger.sendCommand('interpreter-exec console "info mem"', { captureOutput: true });
             const str = miNode.output;
             let match: RegExpExecArray;
             const regex = RegExp(/^[0-9]+\s+([^\s])\s+(0x[0-9a-fA-F]+)\s+(0x[0-9a-fA-F]+)\s+([^\r\n]*)/mgi);
@@ -528,7 +528,7 @@ export class GdbDisassembler {
 
             let dbgRes;
             try {
-                dbgRes = await this.miDebugger.sendCommand(cmd, false, false, true);
+                dbgRes = await this.miDebugger.sendCommand(cmd, { forceNoDebug: true });
             } catch (e) {
                 this.handleMsg('log', `Error: GDB failed: ${e.toString()}\n`);
                 return e as Error;

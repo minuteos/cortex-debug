@@ -930,3 +930,20 @@ class DebugOptions {
     public file: string = '';
     public disassembly: boolean = false;
 }
+
+export interface PromiseWithResolvers<T> {
+    promise: Promise<T>;
+    resolve: (value: T) => void;
+    reject: (error: Error) => void;
+}
+
+// this can be replaced with Promise.withResolvers once it's generally available
+export function promiseWithResolvers<T = void>(): PromiseWithResolvers<T> {
+    let resolve: (value: T) => void;
+    let reject: (error: Error) => void;
+    const promise = new Promise<T>((r, e) => {
+        resolve = r;
+        reject = e;
+    });
+    return { promise, resolve, reject };
+}
