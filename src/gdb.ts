@@ -266,6 +266,8 @@ export class GDBDebugSession extends LoggingDebugSession {
     private swoLaunchPromise = Promise.resolve();
     private swoLaunched?: () => void;
 
+    private sourceFiles = new Map<string, Source>();
+
     public constructor(debuggerLinesStartAt1: boolean, public readonly isServer: boolean = false, threadID: number = 1) {
         super(undefined, debuggerLinesStartAt1, isServer);     // Use if deriving from LogDebugSession
         // super(debuggerLinesStartAt1, isServer);  // Use if deriving from DebugSession
@@ -399,7 +401,11 @@ export class GDBDebugSession extends LoggingDebugSession {
                 str = this.wrapTimeStampRaw(str);
             }
             try {
-                fs.writeSync(this.debugLogFd, str);
+                if (this.debugLogFd >= 0) {
+                    fs.writeSync(this.debugLogFd, str);
+                } else {
+                    console.error(str);
+                }
             } finally {
                 // Do nothing
             }
@@ -3377,6 +3383,18 @@ export class GDBDebugSession extends LoggingDebugSession {
         } catch (msg) {
             this.sendErrorResponse(response, 16, `Could not jump to: ${msg ? msg : ''} ${args.source.path}:${args.line}`);
         }
+    }
+
+    public getSource(sourcePath: string) {
+        if (!sourcePath) {
+            return undefined;
+        }
+        let src = this.sourceFiles.get(sourcePath);
+        if (!src) {
+            src = new Source(path.basename(sourcePath), sourcePath);
+            this.sourceFiles.set(sourcePath, src);
+        }
+        return src;
     }
 }
 

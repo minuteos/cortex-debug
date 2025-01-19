@@ -126,6 +126,7 @@ export class SymbolTable {
     public symbolsAsIntervalTree: IntervalTree<SymbolNode> = new IntervalTree<SymbolNode>();
     public symbolsByAddress: AddressToSym = new AddressToSym();
     public symbolsByAddressOrig: AddressToSym = new AddressToSym();
+    private functionsByAddress: SymbolInformation[];
     private varsByFile: { [path: string]: VariablesInFile } = null;
     private nmPromises: ExecPromise[] = [];
 
@@ -647,6 +648,9 @@ export class SymbolTable {
     }
 
     private categorizeSymbols() {
+        this.functionsByAddress = this.allSymbols.filter((sym) => sym.type === SymbolType.Function);
+        this.functionsByAddress.sort((a, b) => a.address - b.address);
+
         for (const sym of this.allSymbols) {
             const scope = sym.scope;
             const type = sym.type;
@@ -881,6 +885,20 @@ export class SymbolTable {
         }
 
         return null;
+    }
+
+    public getNearestFunctionAddress(addr: number, reverse: boolean): number | undefined {
+        const syms = this.functionsByAddress;
+        let s = 0, e = syms.length;
+        while (s < e) {
+            const m = (s + e) >> 1;
+            if (addr < syms[m].address) {
+                e = m;
+            } else {
+                s = m + 1;
+            }
+        }
+        return syms[reverse ? e - 1 : s]?.address;
     }
 
     public static NormalizePath(pathName: string): string {
