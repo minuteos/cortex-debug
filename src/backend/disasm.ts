@@ -9,6 +9,7 @@ import { DisassemblyInstruction, ConfigurationArguments, ADAPTER_DEBUG_MODE, HrT
 import { SymbolInformation, SymbolType } from '../symbols';
 import { assert } from 'console';
 import { MemoryRegion, SymbolNode } from './symbols';
+import { Sema } from 'async-sema';
 
 enum TargetArchitecture {
     X64, X86, ARM64, ARM, XTENSA, UNKNOWN
@@ -32,14 +33,6 @@ interface DisasmRange {
     verify: number;
     isKnownStart: boolean;        // Set to true if this is a range has a known good start address
     symNode?: SymbolNode;         // Not really used. debugging aid
-}
-
-interface DisasmRequest {
-    response: DebugProtocol.DisassembleResponse;
-    args: DebugProtocol.DisassembleArguments;
-    request?: DebugProtocol.Request;
-    resolve: any;
-    reject: any;
 }
 
 class InstructionRange {
@@ -615,7 +608,7 @@ export class GdbDisassembler {
     // not sure what to do. Code can be anywhere in non-contiguous regions and we have no idea to tell what is even
     // valid.
     //
-    public disassembleProtocolRequest(
+    public async disassembleProtocolRequest(
         response: DebugProtocol.DisassembleResponse,
         args: DebugProtocol.DisassembleArguments,
         request?: DebugProtocol.Request): Promise<void> {
@@ -624,49 +617,25 @@ export class GdbDisassembler {
             return this.customDisassembleRequest(response, args);
         }
         const seq = request?.seq;
-        return new Promise((resolve, reject) => {
-            if (GdbDisassembler.debug) {
-                const msg = `Debug-${seq}: Enqueuing ${JSON.stringify(request)}\n`;
-                this.handleMsg('log', msg);
-                this.debugDump(msg);
-            }
-            const req: DisasmRequest = {
-                response: response,
-                args: args,
-                request: request,
-                resolve: resolve,
-                reject: reject
-            };
-            this.disasmRequestQueue.push(req);
-            if (!this.disasmBusy) {
-                this.runDisasmRequest();
-            } else if (this.doTiming) {
-                this.handleMsg('log', `Debug-${seq}: ******** Waiting for previous request to complete\n`);
-            }
-        });
+        if (GdbDisassembler.debug) {
+            const msg = `Debug-${seq}: Received ${JSON.stringify(request)}\n`;
+            this.handleMsg('log', msg);
+            this.debugDump(msg);
+        }
+
+        await this.disasmSema.acquire();
+        try {
+            await this.disassembleProtocolRequest2(response, args, request);
+        } finally {
+            this.disasmSema.release();
+        }
     }
 
     // VSCode as a client, frequently makes duplicate requests, back to back before results for the first one are ready
     // As a result, older results are not in cache yet, we end up doing work that was not needed. It also happens
     // windows get re-arranged, during reset because we have back to back stops and in other situations. So, we
     // put things in a queue before starting work on the next item. Save quite a bit of work
-    private disasmRequestQueue: DisasmRequest[] = [];
-    private disasmBusy = false;
-    private runDisasmRequest() {
-        if (this.disasmRequestQueue.length > 0) {
-            this.disasmBusy = true;
-            const next = this.disasmRequestQueue.shift();
-            this.disassembleProtocolRequest2(next.response, next.args, next.request).then(() => {
-                this.disasmBusy = false;
-                next.resolve();
-                this.runDisasmRequest();
-            }, (e) => {
-                this.disasmBusy = false;
-                next.reject(e);
-                this.runDisasmRequest();
-            });
-        }
-    }
+    private disasmSema = new Sema(1);
 
     private findNearestSymbolStart(addr: number, max: number): number {
         // If possible, find something in the range that looks like the start of a symbol.
@@ -686,7 +655,7 @@ export class GdbDisassembler {
             await this.getMemoryRegions();
             const seq = request?.seq;
             if (GdbDisassembler.debug) {
-                const msg = `Debug-${seq}: Dequeuing... `;
+                const msg = `Debug-${seq}: Starting... `;
                 this.handleMsg('log', msg + '\n');
                 this.debugDump(msg + JSON.stringify(args));
             }
